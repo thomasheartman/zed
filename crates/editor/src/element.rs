@@ -3074,11 +3074,47 @@ impl EditorElement {
             .collect()
     }
 
+    fn get_absolute_line_number_for_display_row(
+        &self,
+        row_info: &RowInfo,
+        buffer_rows: &[RowInfo],
+        current_ix: usize,
+    ) -> u32 {
+        if let Some(buffer_row) = row_info.buffer_row {
+            buffer_row + 1
+        } else {
+            // For wrapped lines, find the buffer row by searching nearby rows
+            // Search backwards first
+            let mut search_ix = current_ix;
+            while search_ix > 0 && buffer_rows[search_ix].buffer_row.is_none() {
+                search_ix -= 1;
+            }
+            if let Some(buffer_row) = buffer_rows[search_ix].buffer_row {
+                return buffer_row + 1;
+            }
+            
+            // Search forwards if needed
+            let mut search_ix = current_ix + 1;
+            while search_ix < buffer_rows.len() && buffer_rows[search_ix].buffer_row.is_none() {
+                search_ix += 1;
+            }
+            if search_ix < buffer_rows.len() {
+                if let Some(buffer_row) = buffer_rows[search_ix].buffer_row {
+                    return buffer_row + 1;
+                }
+            }
+            
+            // Ultimate fallback
+            1
+        }
+    }
+
     fn calculate_relative_line_numbers(
         &self,
         snapshot: &EditorSnapshot,
         rows: &Range<DisplayRow>,
         relative_to: Option<DisplayRow>,
+        include_wrapped_lines: bool,
     ) -> HashMap<DisplayRow, DisplayRowDelta> {
         let mut relative_rows: HashMap<DisplayRow, DisplayRowDelta> = Default::default();
         let Some(relative_to) = relative_to else {
@@ -3094,30 +3130,64 @@ impl EditorElement {
             .collect::<Vec<_>>();
 
         let head_idx = relative_to.minus(start);
-        let mut delta = 1;
-        let mut i = head_idx + 1;
-        while i < buffer_rows.len() as u32 {
-            if buffer_rows[i as usize].buffer_row.is_some() {
-                if rows.contains(&DisplayRow(i + start.0)) {
-                    relative_rows.insert(DisplayRow(i + start.0), delta);
+        
+        if include_wrapped_lines {
+            // Count all display rows (including wrapped lines)
+            // Process rows after the cursor
+            let mut delta = 1;
+            let mut i = head_idx + 1;
+            while i < buffer_rows.len() as u32 {
+                let display_row = DisplayRow(i + start.0);
+                if rows.contains(&display_row) {
+                    relative_rows.insert(display_row, delta);
                 }
                 delta += 1;
+                i += 1;
             }
-            i += 1;
-        }
-        delta = 1;
-        i = head_idx.min(buffer_rows.len() as u32 - 1);
-        while i > 0 && buffer_rows[i as usize].buffer_row.is_none() {
-            i -= 1;
-        }
-
-        while i > 0 {
-            i -= 1;
-            if buffer_rows[i as usize].buffer_row.is_some() {
-                if rows.contains(&DisplayRow(i + start.0)) {
-                    relative_rows.insert(DisplayRow(i + start.0), delta);
+            
+            // Process rows before the cursor
+            delta = 1;
+            if head_idx > 0 {
+                let mut i = head_idx - 1;
+                loop {
+                    let display_row = DisplayRow(i + start.0);
+                    if rows.contains(&display_row) {
+                        relative_rows.insert(display_row, delta);
+                    }
+                    delta += 1;
+                    if i == 0 {
+                        break;
+                    }
+                    i -= 1;
                 }
-                delta += 1;
+            }
+        } else {
+            // Original logic: only count buffer lines
+            let mut delta = 1;
+            let mut i = head_idx + 1;
+            while i < buffer_rows.len() as u32 {
+                if buffer_rows[i as usize].buffer_row.is_some() {
+                    if rows.contains(&DisplayRow(i + start.0)) {
+                        relative_rows.insert(DisplayRow(i + start.0), delta);
+                    }
+                    delta += 1;
+                }
+                i += 1;
+            }
+            delta = 1;
+            i = head_idx.min(buffer_rows.len() as u32 - 1);
+            while i > 0 && buffer_rows[i as usize].buffer_row.is_none() {
+                i -= 1;
+            }
+
+            while i > 0 {
+                i -= 1;
+                if buffer_rows[i as usize].buffer_row.is_some() {
+                    if rows.contains(&DisplayRow(i + start.0)) {
+                        relative_rows.insert(DisplayRow(i + start.0), delta);
+                    }
+                    delta += 1;
+                }
             }
         }
 
@@ -3145,7 +3215,7 @@ impl EditorElement {
             return Arc::default();
         }
 
-        let (newest_selection_head, is_relative) = self.editor.update(cx, |editor, cx| {
+        let (newest_selection_head, is_relative, include_wrapped_lines) = self.editor.update(cx, |editor, cx| {
             let newest_selection_head = newest_selection_head.unwrap_or_else(|| {
                 let newest = editor.selections.newest::<Point>(cx);
                 SelectionLayout::new(
@@ -3160,7 +3230,8 @@ impl EditorElement {
                 .head
             });
             let is_relative = editor.should_use_relative_line_numbers(cx);
-            (newest_selection_head, is_relative)
+            let include_wrapped_lines = EditorSettings::get_global(cx).relative_line_numbers_for_wrapped_lines;
+            (newest_selection_head, is_relative, include_wrapped_lines)
         });
 
         let relative_to = if is_relative {
@@ -3168,7 +3239,10 @@ impl EditorElement {
         } else {
             None
         };
-        let relative_rows = self.calculate_relative_line_numbers(snapshot, &rows, relative_to);
+        let relative_rows = self.calculate_relative_line_numbers(snapshot, &rows, relative_to, include_wrapped_lines && is_relative);
+        
+        // For debugging: let's also prepare for on-demand calculation
+        let should_calculate_on_demand = include_wrapped_lines && is_relative;
         let mut line_number = String::new();
         let line_numbers = buffer_rows
             .iter()
@@ -3176,10 +3250,54 @@ impl EditorElement {
             .flat_map(|(ix, row_info)| {
                 let display_row = DisplayRow(rows.start.0 + ix as u32);
                 line_number.clear();
-                let non_relative_number = row_info.buffer_row? + 1;
-                let number = relative_rows
-                    .get(&display_row)
-                    .unwrap_or(&non_relative_number);
+                
+                // Determine what number to show for this display row
+                let number = if should_calculate_on_demand {
+                    // New simple logic for wrapped relative line numbers
+                    // Note: should_calculate_on_demand implies is_relative is true, so relative_to should always be Some
+                    let relative_to_row = relative_to.expect("should_calculate_on_demand implies relative_to is Some");
+                    
+                    if display_row == relative_to_row {
+                        // Current line: always show absolute line number
+                        self.get_absolute_line_number_for_display_row(row_info, &buffer_rows, ix)
+                    } else {
+                        // All other lines: calculate relative distance from cursor
+                        let distance = if display_row.0 > relative_to_row.0 {
+                            display_row.0 - relative_to_row.0
+                        } else {
+                            relative_to_row.0 - display_row.0
+                        };
+                        distance as u32
+                    }
+                } else {
+                    // Original logic for non-wrapped relative numbers
+                    if let Some(relative_to_row) = relative_to {
+                        if display_row == relative_to_row {
+                            // Current line: show absolute
+                            if let Some(buffer_row) = row_info.buffer_row {
+                                buffer_row + 1
+                            } else {
+                                return None;
+                            }
+                        } else if let Some(&relative_number) = relative_rows.get(&display_row) {
+                            // Use pre-calculated relative number
+                            relative_number
+                        } else if let Some(buffer_row) = row_info.buffer_row {
+                            // Buffer line without relative number
+                            buffer_row + 1
+                        } else {
+                            // Wrapped line - skip
+                            return None;
+                        }
+                    } else {
+                        // No relative numbering
+                        if let Some(buffer_row) = row_info.buffer_row {
+                            buffer_row + 1
+                        } else {
+                            return None;
+                        }
+                    }
+                };
                 write!(&mut line_number, "{number}").unwrap();
                 if row_info
                     .diff_status
@@ -3222,8 +3340,15 @@ impl EditorElement {
                     None
                 };
 
-                let multi_buffer_row = DisplayPoint::new(display_row, 0).to_point(snapshot).row;
-                let multi_buffer_row = MultiBufferRow(multi_buffer_row);
+                let multi_buffer_row = if should_calculate_on_demand {
+                    // For wrapped line numbers, create unique keys for each display row
+                    // We use a synthetic key based on display row to avoid collisions
+                    MultiBufferRow(display_row.0 + 1000000) // Large offset to avoid conflicts with real buffer rows
+                } else {
+                    // Original behavior: use actual buffer row as key
+                    let buffer_row = DisplayPoint::new(display_row, 0).to_point(snapshot).row;
+                    MultiBufferRow(buffer_row)
+                };
                 let line_number = LineNumberLayout {
                     shaped_line,
                     hitbox,
