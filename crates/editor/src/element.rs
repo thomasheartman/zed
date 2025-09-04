@@ -3113,90 +3113,6 @@ impl EditorElement {
         }
     }
 
-    fn calculate_relative_line_numbers(
-        &self,
-        snapshot: &EditorSnapshot,
-        rows: &Range<DisplayRow>,
-        relative_to: Option<DisplayRow>,
-        include_wrapped_lines: bool,
-    ) -> HashMap<DisplayRow, DisplayRowDelta> {
-        let mut relative_rows: HashMap<DisplayRow, DisplayRowDelta> = Default::default();
-        let Some(relative_to) = relative_to else {
-            return relative_rows;
-        };
-
-        let start = rows.start.min(relative_to);
-        let end = rows.end.max(relative_to);
-
-        let buffer_rows = snapshot
-            .row_infos(start)
-            .take(1 + end.minus(start) as usize)
-            .collect::<Vec<_>>();
-
-        let head_idx = relative_to.minus(start);
-        
-        if include_wrapped_lines {
-            // Count all display rows (including wrapped lines)
-            // Process rows after the cursor
-            let mut delta = 1;
-            let mut i = head_idx + 1;
-            while i < buffer_rows.len() as u32 {
-                let display_row = DisplayRow(i + start.0);
-                if rows.contains(&display_row) {
-                    relative_rows.insert(display_row, delta);
-                }
-                delta += 1;
-                i += 1;
-            }
-            
-            // Process rows before the cursor
-            delta = 1;
-            if head_idx > 0 {
-                let mut i = head_idx - 1;
-                loop {
-                    let display_row = DisplayRow(i + start.0);
-                    if rows.contains(&display_row) {
-                        relative_rows.insert(display_row, delta);
-                    }
-                    delta += 1;
-                    if i == 0 {
-                        break;
-                    }
-                    i -= 1;
-                }
-            }
-        } else {
-            // Original logic: only count buffer lines
-            let mut delta = 1;
-            let mut i = head_idx + 1;
-            while i < buffer_rows.len() as u32 {
-                if buffer_rows[i as usize].buffer_row.is_some() {
-                    if rows.contains(&DisplayRow(i + start.0)) {
-                        relative_rows.insert(DisplayRow(i + start.0), delta);
-                    }
-                    delta += 1;
-                }
-                i += 1;
-            }
-            delta = 1;
-            i = head_idx.min(buffer_rows.len() as u32 - 1);
-            while i > 0 && buffer_rows[i as usize].buffer_row.is_none() {
-                i -= 1;
-            }
-
-            while i > 0 {
-                i -= 1;
-                if buffer_rows[i as usize].buffer_row.is_some() {
-                    if rows.contains(&DisplayRow(i + start.0)) {
-                        relative_rows.insert(DisplayRow(i + start.0), delta);
-                    }
-                    delta += 1;
-                }
-            }
-        }
-
-        relative_rows
-    }
 
     fn layout_line_numbers(
         &self,
@@ -3238,15 +3154,12 @@ impl EditorElement {
             (newest_selection_head, is_relative, include_wrapped_lines)
         });
 
-        let relative_to = if is_relative {
+        let cursor_row = if is_relative {
             Some(newest_selection_head.row())
         } else {
             None
         };
-        let relative_rows = self.calculate_relative_line_numbers(snapshot, &rows, relative_to, include_wrapped_lines && is_relative);
-        
-        // For debugging: let's also prepare for on-demand calculation
-        let should_calculate_on_demand = include_wrapped_lines && is_relative;
+
         let mut line_number = String::new();
         let segments = buffer_rows
             .iter()
@@ -3256,45 +3169,43 @@ impl EditorElement {
                 line_number.clear();
                 
                 // Determine what number to show for this display row
-                let number = if should_calculate_on_demand {
-                    // New simple logic for wrapped relative line numbers
-                    // Note: should_calculate_on_demand implies is_relative is true, so relative_to should always be Some
-                    let relative_to_row = relative_to.expect("should_calculate_on_demand implies relative_to is Some");
-                    
-                    if display_row == relative_to_row {
-                        // Current line: always show absolute line number
-                        self.get_absolute_line_number_for_display_row(row_info, &buffer_rows, ix)
-                    } else {
-                        // All other lines: calculate relative distance from cursor
-                        let distance = if display_row.0 > relative_to_row.0 {
-                            display_row.0 - relative_to_row.0
+                let number = match (cursor_row, include_wrapped_lines) {
+                    (Some(cursor_row), true) => {
+                        // Relative line numbers for wrapped lines
+                        if display_row == cursor_row {
+                            // Current line: show absolute line number
+                            self.get_absolute_line_number_for_display_row(row_info, &buffer_rows, ix)
                         } else {
-                            relative_to_row.0 - display_row.0
-                        };
-                        distance as u32
-                    }
-                } else {
-                    // Original logic for non-wrapped relative numbers
-                    if let Some(relative_to_row) = relative_to {
-                        if display_row == relative_to_row {
-                            // Current line: show absolute
-                            if let Some(buffer_row) = row_info.buffer_row {
-                                buffer_row + 1
+                            // Other lines: show relative distance
+                            let distance = if display_row.0 > cursor_row.0 {
+                                display_row.0 - cursor_row.0
                             } else {
-                                return None;
-                            }
-                        } else if let Some(&relative_number) = relative_rows.get(&display_row) {
-                            // Use pre-calculated relative number
-                            relative_number
-                        } else if let Some(buffer_row) = row_info.buffer_row {
-                            // Buffer line without relative number
-                            buffer_row + 1
-                        } else {
-                            // Wrapped line - skip
-                            return None;
+                                cursor_row.0 - display_row.0
+                            };
+                            distance as u32
                         }
-                    } else {
-                        // No relative numbering
+                    }
+                    (Some(cursor_row), false) => {
+                        // Traditional relative line numbers (buffer lines only)
+                        if let Some(buffer_row) = row_info.buffer_row {
+                            if display_row == cursor_row {
+                                buffer_row + 1  // Current line shows absolute
+                            } else {
+                                // Calculate relative number based on buffer lines only
+                                let cursor_buffer_row = DisplayPoint::new(cursor_row, 0).to_point(snapshot).row;
+                                let distance = if buffer_row > cursor_buffer_row {
+                                    buffer_row - cursor_buffer_row
+                                } else {
+                                    cursor_buffer_row - buffer_row
+                                };
+                                distance + 1
+                            }
+                        } else {
+                            return None; // Skip wrapped lines
+                        }
+                    }
+                    (None, _) => {
+                        // No relative numbering - show absolute line numbers for buffer lines only
                         if let Some(buffer_row) = row_info.buffer_row {
                             buffer_row + 1
                         } else {
