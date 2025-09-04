@@ -3147,6 +3147,23 @@ impl EditorElement {
             None
         };
 
+        // Build lookup set of separator rows (should not get line numbers or count in distances)
+        let separator_rows: std::collections::HashSet<DisplayRow> = snapshot.display_snapshot
+            .blocks_in_range(rows.clone())
+            .flat_map(|(row, block)| {
+                match block {
+                    Block::ExcerptBoundary { .. } => {
+                        vec![row] // 1 line height
+                    }
+                    Block::BufferHeader { height, .. } => {
+                        // Generate all rows for this multi-line block
+                        (0..*height).map(|offset| DisplayRow(row.0 + offset)).collect()
+                    }
+                    _ => vec![],
+                }
+            })
+            .collect();
+
         let mut line_number = String::new();
         let segments = buffer_rows
             .iter()
@@ -3154,6 +3171,11 @@ impl EditorElement {
             .flat_map(|(ix, row_info)| {
                 let display_row = DisplayRow(rows.start.0 + ix as u32);
                 line_number.clear();
+                
+                // Skip separator blocks (ExcerptBoundary and BufferHeader)
+                if separator_rows.contains(&display_row) {
+                    return None;
+                }
                 
                 // Determine what number to show for this display row
                 let number = match (cursor_row, include_wrapped_lines) {
@@ -3163,13 +3185,23 @@ impl EditorElement {
                             // Current line: show absolute line number
                             self.get_absolute_line_number_for_display_row(row_info, &buffer_rows, ix)
                         } else {
-                            // Other lines: show relative distance
-                            let distance = if display_row.0 > cursor_row.0 {
-                                display_row.0 - cursor_row.0
+                            // Other lines: show relative distance, counting only navigable rows
+                            let current_row = display_row;
+                            let (start, end) = if current_row > cursor_row {
+                                (cursor_row.0 + 1, current_row.0 + 1)
                             } else {
-                                cursor_row.0 - display_row.0
+                                (current_row.0, cursor_row.0)
                             };
-                            distance as u32
+                            
+                            // Count only navigable rows (skip separator blocks entirely)
+                            let mut distance = 0u32;
+                            for row_idx in start..end {
+                                let check_row = DisplayRow(row_idx);
+                                if !separator_rows.contains(&check_row) {
+                                    distance += 1;
+                                }
+                            }
+                            distance
                         }
                     }
                     (Some(cursor_row), false) => {
