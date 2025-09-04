@@ -774,8 +774,12 @@ impl EditorElement {
                 .row;
             if line_numbers
                 .get(&MultiBufferRow(multi_buffer_row))
-                .and_then(|line_number| line_number.hitbox.as_ref())
-                .is_some_and(|hitbox| hitbox.contains(&event.position))
+                .is_some_and(|line_layout| {
+                    line_layout.segments.iter().any(|segment| {
+                        segment.hitbox.as_ref()
+                            .is_some_and(|hitbox| hitbox.contains(&event.position))
+                    })
+                })
             {
                 let scroll_position_row =
                     position_map.scroll_pixel_position.y / position_map.line_height;
@@ -3244,7 +3248,7 @@ impl EditorElement {
         // For debugging: let's also prepare for on-demand calculation
         let should_calculate_on_demand = include_wrapped_lines && is_relative;
         let mut line_number = String::new();
-        let line_numbers = buffer_rows
+        let segments = buffer_rows
             .iter()
             .enumerate()
             .flat_map(|(ix, row_info)| {
@@ -3340,22 +3344,31 @@ impl EditorElement {
                     None
                 };
 
-                let multi_buffer_row = if should_calculate_on_demand {
-                    // For wrapped line numbers, create unique keys for each display row
-                    // We use a synthetic key based on display row to avoid collisions
-                    MultiBufferRow(display_row.0 + 1000000) // Large offset to avoid conflicts with real buffer rows
-                } else {
-                    // Original behavior: use actual buffer row as key
-                    let buffer_row = DisplayPoint::new(display_row, 0).to_point(snapshot).row;
-                    MultiBufferRow(buffer_row)
-                };
-                let line_number = LineNumberLayout {
+                // Create a line number segment for this display row
+                let segment = LineNumberSegment {
                     shaped_line,
                     hitbox,
                 };
-                Some((multi_buffer_row, line_number))
-            })
-            .collect();
+
+                // Get the buffer row to use as the grouping key
+                let buffer_row = DisplayPoint::new(display_row, 0).to_point(snapshot).row;
+                let multi_buffer_row = MultiBufferRow(buffer_row);
+
+                Some((multi_buffer_row, segment))
+            });
+
+        // Group segments by buffer row and create LineNumberLayout for each
+        let mut line_numbers: HashMap<MultiBufferRow, LineNumberLayout> = HashMap::new();
+        for (buffer_row, segment) in segments {
+            line_numbers
+                .entry(buffer_row)
+                .or_insert_with(|| LineNumberLayout {
+                    segments: Vec::new(),
+                })
+                .segments
+                .push(segment);
+        }
+
         Arc::new(line_numbers)
     }
 
@@ -5881,34 +5894,36 @@ impl EditorElement {
         let line_height = layout.position_map.line_height;
         window.set_cursor_style(CursorStyle::Arrow, &layout.gutter_hitbox);
 
-        for LineNumberLayout {
-            shaped_line,
-            hitbox,
-        } in layout.line_numbers.values()
-        {
-            let Some(hitbox) = hitbox else {
-                continue;
-            };
+        for line_layout in layout.line_numbers.values() {
+            for LineNumberSegment {
+                shaped_line,
+                hitbox,
+            } in &line_layout.segments
+            {
+                let Some(hitbox) = hitbox else {
+                    continue;
+                };
 
-            let Some(()) = (if !is_singleton && hitbox.is_hovered(window) {
-                let color = cx.theme().colors().editor_hover_line_number;
+                let Some(()) = (if !is_singleton && hitbox.is_hovered(window) {
+                    let color = cx.theme().colors().editor_hover_line_number;
 
-                let line = self.shape_line_number(shaped_line.text.clone(), color, window);
-                line.paint(hitbox.origin, line_height, window, cx).log_err()
-            } else {
-                shaped_line
-                    .paint(hitbox.origin, line_height, window, cx)
-                    .log_err()
-            }) else {
-                continue;
-            };
+                    let line = self.shape_line_number(shaped_line.text.clone(), color, window);
+                    line.paint(hitbox.origin, line_height, window, cx).log_err()
+                } else {
+                    shaped_line
+                        .paint(hitbox.origin, line_height, window, cx)
+                        .log_err()
+                }) else {
+                    continue;
+                };
 
-            // In singleton buffers, we select corresponding lines on the line number click, so use | -like cursor.
-            // In multi buffers, we open file at the line number clicked, so use a pointing hand cursor.
-            if is_singleton {
-                window.set_cursor_style(CursorStyle::IBeam, hitbox);
-            } else {
-                window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+                // In singleton buffers, we select corresponding lines on the line number click, so use | -like cursor.
+                // In multi buffers, we open file at the line number clicked, so use a pointing hand cursor.
+                if is_singleton {
+                    window.set_cursor_style(CursorStyle::IBeam, hitbox);
+                } else {
+                    window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+                }
             }
         }
     }
@@ -9760,9 +9775,13 @@ impl EditorLayout {
     }
 }
 
-struct LineNumberLayout {
+struct LineNumberSegment {
     shaped_line: ShapedLine,
     hitbox: Option<Hitbox>,
+}
+
+struct LineNumberLayout {
+    segments: Vec<LineNumberSegment>,
 }
 
 struct ColoredRange<T> {
