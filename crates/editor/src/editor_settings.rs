@@ -33,6 +33,7 @@ pub struct EditorSettings {
     pub scroll_sensitivity: f32,
     pub fast_scroll_sensitivity: f32,
     pub relative_line_numbers: bool,
+    pub relative_line_numbers_for_wrapped_lines: bool,
     pub seed_search_query_from_cursor: SeedQuerySetting,
     pub use_smartcase_search: bool,
     pub multi_cursor_modifier: MultiCursorModifier,
@@ -518,6 +519,10 @@ pub struct EditorSettingsContent {
     ///
     /// Default: false
     pub relative_line_numbers: Option<bool>,
+    /// Whether to show relative line numbers for wrapped lines (visual lines) rather than just buffer lines.
+    ///
+    /// Default: false  
+    pub relative_line_numbers_for_wrapped_lines: Option<bool>,
     /// When to populate a new search's query based on the text under the cursor.
     ///
     /// Default: always

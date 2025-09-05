@@ -769,8 +769,12 @@ impl EditorElement {
                 .row;
             if line_numbers
                 .get(&MultiBufferRow(multi_buffer_row))
-                .and_then(|line_number| line_number.hitbox.as_ref())
-                .is_some_and(|hitbox| hitbox.contains(&event.position))
+                .is_some_and(|line_layout| {
+                    line_layout.segments.iter().any(|segment| {
+                        segment.hitbox.as_ref()
+                            .is_some_and(|hitbox| hitbox.contains(&event.position))
+                    })
+                })
             {
                 let scroll_position_row =
                     position_map.scroll_pixel_position.y / position_map.line_height;
@@ -3061,55 +3065,41 @@ impl EditorElement {
             .collect()
     }
 
-    fn calculate_relative_line_numbers(
+    fn get_absolute_line_number_for_display_row(
         &self,
-        snapshot: &EditorSnapshot,
-        rows: &Range<DisplayRow>,
-        relative_to: Option<DisplayRow>,
-    ) -> HashMap<DisplayRow, DisplayRowDelta> {
-        let mut relative_rows: HashMap<DisplayRow, DisplayRowDelta> = Default::default();
-        let Some(relative_to) = relative_to else {
-            return relative_rows;
-        };
-
-        let start = rows.start.min(relative_to);
-        let end = rows.end.max(relative_to);
-
-        let buffer_rows = snapshot
-            .row_infos(start)
-            .take(1 + end.minus(start) as usize)
-            .collect::<Vec<_>>();
-
-        let head_idx = relative_to.minus(start);
-        let mut delta = 1;
-        let mut i = head_idx + 1;
-        while i < buffer_rows.len() as u32 {
-            if buffer_rows[i as usize].buffer_row.is_some() {
-                if rows.contains(&DisplayRow(i + start.0)) {
-                    relative_rows.insert(DisplayRow(i + start.0), delta);
-                }
-                delta += 1;
+        row_info: &RowInfo,
+        buffer_rows: &[RowInfo],
+        current_ix: usize,
+    ) -> u32 {
+        if let Some(buffer_row) = row_info.buffer_row {
+            buffer_row + 1
+        } else {
+            // For wrapped lines, find the buffer row by searching nearby rows
+            // Search backwards first
+            let mut search_ix = current_ix;
+            while search_ix > 0 && buffer_rows[search_ix].buffer_row.is_none() {
+                search_ix -= 1;
             }
-            i += 1;
-        }
-        delta = 1;
-        i = head_idx.min(buffer_rows.len() as u32 - 1);
-        while i > 0 && buffer_rows[i as usize].buffer_row.is_none() {
-            i -= 1;
-        }
-
-        while i > 0 {
-            i -= 1;
-            if buffer_rows[i as usize].buffer_row.is_some() {
-                if rows.contains(&DisplayRow(i + start.0)) {
-                    relative_rows.insert(DisplayRow(i + start.0), delta);
-                }
-                delta += 1;
+            if let Some(buffer_row) = buffer_rows[search_ix].buffer_row {
+                return buffer_row + 1;
             }
+            
+            // Search forwards if needed
+            let mut search_ix = current_ix + 1;
+            while search_ix < buffer_rows.len() && buffer_rows[search_ix].buffer_row.is_none() {
+                search_ix += 1;
+            }
+            if search_ix < buffer_rows.len() {
+                if let Some(buffer_row) = buffer_rows[search_ix].buffer_row {
+                    return buffer_row + 1;
+                }
+            }
+            
+            // Ultimate fallback
+            1
         }
-
-        relative_rows
     }
+
 
     fn layout_line_numbers(
         &self,
@@ -3132,7 +3122,7 @@ impl EditorElement {
             return Arc::default();
         }
 
-        let (newest_selection_head, is_relative) = self.editor.update(cx, |editor, cx| {
+        let (newest_selection_head, is_relative, include_wrapped_lines) = self.editor.update(cx, |editor, cx| {
             let newest_selection_head = newest_selection_head.unwrap_or_else(|| {
                 let newest = editor.selections.newest::<Point>(cx);
                 SelectionLayout::new(
@@ -3147,26 +3137,101 @@ impl EditorElement {
                 .head
             });
             let is_relative = editor.should_use_relative_line_numbers(cx);
-            (newest_selection_head, is_relative)
+            let include_wrapped_lines = EditorSettings::get_global(cx).relative_line_numbers_for_wrapped_lines;
+            (newest_selection_head, is_relative, include_wrapped_lines)
         });
 
-        let relative_to = if is_relative {
+        let cursor_row = if is_relative {
             Some(newest_selection_head.row())
         } else {
             None
         };
-        let relative_rows = self.calculate_relative_line_numbers(snapshot, &rows, relative_to);
+
+        // Build lookup set of separator rows (should not get line numbers or count in distances)
+        let separator_rows: std::collections::HashSet<DisplayRow> = snapshot.display_snapshot
+            .blocks_in_range(rows.clone())
+            .flat_map(|(row, block)| {
+                match block {
+                    Block::ExcerptBoundary { .. } => {
+                        vec![row] // 1 line height
+                    }
+                    Block::BufferHeader { height, .. } => {
+                        // Generate all rows for this multi-line block
+                        (0..*height).map(|offset| DisplayRow(row.0 + offset)).collect()
+                    }
+                    _ => vec![],
+                }
+            })
+            .collect();
+
         let mut line_number = String::new();
-        let line_numbers = buffer_rows
+        let segments = buffer_rows
             .iter()
             .enumerate()
             .flat_map(|(ix, row_info)| {
                 let display_row = DisplayRow(rows.start.0 + ix as u32);
                 line_number.clear();
-                let non_relative_number = row_info.buffer_row? + 1;
-                let number = relative_rows
-                    .get(&display_row)
-                    .unwrap_or(&non_relative_number);
+                
+                // Skip separator blocks (ExcerptBoundary and BufferHeader)
+                if separator_rows.contains(&display_row) {
+                    return None;
+                }
+                
+                // Determine what number to show for this display row
+                let number = match (cursor_row, include_wrapped_lines) {
+                    (Some(cursor_row), true) => {
+                        // Relative line numbers for wrapped lines
+                        if display_row == cursor_row {
+                            // Current line: show absolute line number
+                            self.get_absolute_line_number_for_display_row(row_info, &buffer_rows, ix)
+                        } else {
+                            // Other lines: show relative distance, counting only navigable rows
+                            let current_row = display_row;
+                            let (start, end) = if current_row > cursor_row {
+                                (cursor_row.0 + 1, current_row.0 + 1)
+                            } else {
+                                (current_row.0, cursor_row.0)
+                            };
+                            
+                            // Count only navigable rows (skip separator blocks entirely)
+                            let mut distance = 0u32;
+                            for row_idx in start..end {
+                                let check_row = DisplayRow(row_idx);
+                                if !separator_rows.contains(&check_row) {
+                                    distance += 1;
+                                }
+                            }
+                            distance
+                        }
+                    }
+                    (Some(cursor_row), false) => {
+                        // Traditional relative line numbers (buffer lines only)
+                        if let Some(buffer_row) = row_info.buffer_row {
+                            if display_row == cursor_row {
+                                buffer_row + 1  // Current line shows absolute
+                            } else {
+                                // Calculate relative number based on buffer lines only
+                                let cursor_buffer_row = DisplayPoint::new(cursor_row, 0).to_point(snapshot).row;
+                                let distance = if buffer_row > cursor_buffer_row {
+                                    buffer_row - cursor_buffer_row
+                                } else {
+                                    cursor_buffer_row - buffer_row
+                                };
+                                distance + 1
+                            }
+                        } else {
+                            return None; // Skip wrapped lines
+                        }
+                    }
+                    (None, _) => {
+                        // No relative numbering - show absolute line numbers for buffer lines only
+                        if let Some(buffer_row) = row_info.buffer_row {
+                            buffer_row + 1
+                        } else {
+                            return None;
+                        }
+                    }
+                };
                 write!(&mut line_number, "{number}").unwrap();
                 if row_info
                     .diff_status
@@ -3209,15 +3274,31 @@ impl EditorElement {
                     None
                 };
 
-                let multi_buffer_row = DisplayPoint::new(display_row, 0).to_point(snapshot).row;
-                let multi_buffer_row = MultiBufferRow(multi_buffer_row);
-                let line_number = LineNumberLayout {
+                // Create a line number segment for this display row
+                let segment = LineNumberSegment {
                     shaped_line,
                     hitbox,
                 };
-                Some((multi_buffer_row, line_number))
-            })
-            .collect();
+
+                // Get the buffer row to use as the grouping key
+                let buffer_row = DisplayPoint::new(display_row, 0).to_point(snapshot).row;
+                let multi_buffer_row = MultiBufferRow(buffer_row);
+
+                Some((multi_buffer_row, segment))
+            });
+
+        // Group segments by buffer row and create LineNumberLayout for each
+        let mut line_numbers: HashMap<MultiBufferRow, LineNumberLayout> = HashMap::new();
+        for (buffer_row, segment) in segments {
+            line_numbers
+                .entry(buffer_row)
+                .or_insert_with(|| LineNumberLayout {
+                    segments: Vec::new(),
+                })
+                .segments
+                .push(segment);
+        }
+
         Arc::new(line_numbers)
     }
 
@@ -5726,34 +5807,36 @@ impl EditorElement {
         let line_height = layout.position_map.line_height;
         window.set_cursor_style(CursorStyle::Arrow, &layout.gutter_hitbox);
 
-        for LineNumberLayout {
-            shaped_line,
-            hitbox,
-        } in layout.line_numbers.values()
-        {
-            let Some(hitbox) = hitbox else {
-                continue;
-            };
+        for line_layout in layout.line_numbers.values() {
+            for LineNumberSegment {
+                shaped_line,
+                hitbox,
+            } in &line_layout.segments
+            {
+                let Some(hitbox) = hitbox else {
+                    continue;
+                };
 
-            let Some(()) = (if !is_singleton && hitbox.is_hovered(window) {
-                let color = cx.theme().colors().editor_hover_line_number;
+                let Some(()) = (if !is_singleton && hitbox.is_hovered(window) {
+                    let color = cx.theme().colors().editor_hover_line_number;
 
-                let line = self.shape_line_number(shaped_line.text.clone(), color, window);
-                line.paint(hitbox.origin, line_height, window, cx).log_err()
-            } else {
-                shaped_line
-                    .paint(hitbox.origin, line_height, window, cx)
-                    .log_err()
-            }) else {
-                continue;
-            };
+                    let line = self.shape_line_number(shaped_line.text.clone(), color, window);
+                    line.paint(hitbox.origin, line_height, window, cx).log_err()
+                } else {
+                    shaped_line
+                        .paint(hitbox.origin, line_height, window, cx)
+                        .log_err()
+                }) else {
+                    continue;
+                };
 
-            // In singleton buffers, we select corresponding lines on the line number click, so use | -like cursor.
-            // In multi buffers, we open file at the line number clicked, so use a pointing hand cursor.
-            if is_singleton {
-                window.set_cursor_style(CursorStyle::IBeam, hitbox);
-            } else {
-                window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+                // In singleton buffers, we select corresponding lines on the line number click, so use | -like cursor.
+                // In multi buffers, we open file at the line number clicked, so use a pointing hand cursor.
+                if is_singleton {
+                    window.set_cursor_style(CursorStyle::IBeam, hitbox);
+                } else {
+                    window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+                }
             }
         }
     }
@@ -9548,9 +9631,13 @@ impl EditorLayout {
     }
 }
 
-struct LineNumberLayout {
+struct LineNumberSegment {
     shaped_line: ShapedLine,
     hitbox: Option<Hitbox>,
+}
+
+struct LineNumberLayout {
+    segments: Vec<LineNumberSegment>,
 }
 
 struct ColoredRange<T> {
