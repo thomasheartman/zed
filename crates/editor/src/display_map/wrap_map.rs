@@ -1023,6 +1023,7 @@ impl Iterator for WrapRows<'_> {
                 multibuffer_row: None,
                 diff_status,
                 expand_info: None,
+                wrapped: true,
             }
         } else {
             buffer_row
