@@ -1019,7 +1019,7 @@ impl Iterator for WrapRows<'_> {
         Some(if soft_wrapped {
             RowInfo {
                 buffer_id: None,
-                buffer_row: None,
+                buffer_row: buffer_row.buffer_row,
                 multibuffer_row: None,
                 diff_status,
                 expand_info: None,
